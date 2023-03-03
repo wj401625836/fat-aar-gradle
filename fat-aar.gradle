@@ -984,7 +984,7 @@ class AarPlugin implements Plugin<Project> {
                     println("depProjectArray = $depProjectArray")
                     configuration.resolvedConfiguration.resolvedArtifacts.each { artifact ->
                         def displayName = artifact.id.componentIdentifier.displayName
-                        def (groupName, ext) = displayName.tokenize(':')
+                        def groupName = artifact.moduleVersion.id.group
                         def moduleName = artifact.moduleVersion.id.module.name
                         def contains = depRemoteArray.contains(groupName) || depLocaleArray.contains(moduleName)
                         println("resolvedConfiguration = $displayName / $groupName / $moduleName / contains = $contains")
