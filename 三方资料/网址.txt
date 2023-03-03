@@ -1,0 +1,6 @@
+https://blog.csdn.net/wanghonghongkx/article/details/125533528
+https://github.com/kezong/fat-aar-android
+https://blog.hugozhu.site/2014/11/05/52-assemble-aar-with-all-dependencies-with-gradle.html
+https://blog.csdn.net/szdenny/article/details/128958085
+https://blog.csdn.net/yishichangan1/article/details/78416193
+https://github.com/melody26613/android-fat-aar-by-gradle

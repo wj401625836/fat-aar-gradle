@@ -1,0 +1,1002 @@
+import org.gradle.api.internal.artifacts.DefaultModuleVersionIdentifier
+import org.gradle.api.internal.artifacts.dependencies.DefaultProjectDependency
+import org.gradle.api.internal.tasks.CachingTaskDependencyResolveContext
+import org.gradle.api.internal.tasks.TaskDependencyContainer
+import org.gradle.api.internal.tasks.TaskDependencyResolveContext
+import org.gradle.internal.DisplayName
+import org.gradle.internal.Factory
+import org.gradle.internal.component.model.DefaultIvyArtifactName
+
+import javax.annotation.Nullable
+
+//插件扩展
+class FatAarExtension {
+    /**
+     * true 将依赖库的依赖库一起打包（可能打包不全，待优化）
+     * false 只打包依赖库
+     * 建议默认为true
+     */
+    boolean transitive = true
+}
+//主要用于创建本地其他module构件，查看createFlavorArtifact的调用
+class FlavorArtifact {
+
+    // since 6.8.0
+    private static final String CLASS_PreResolvedResolvableArtifact = "org.gradle.api.internal.artifacts.PreResolvedResolvableArtifact";
+    // since 6.8.0
+    private static final String CLASS_CalculatedValueContainer = "org.gradle.internal.model.CalculatedValueContainer"
+
+    private static final String CLASS_DefaultResolvedArtifact = "org.gradle.api.internal.artifacts.DefaultResolvedArtifact"
+
+    static ResolvedArtifact createFlavorArtifact(Project project, def variant, ResolvedDependency unResolvedArtifact) {
+//        println("createFlavorArtifact variant = $variant / unResolvedArtifact = $unResolvedArtifact")
+        Project artifactProject = getArtifactProject(project, unResolvedArtifact)
+        TaskProvider bundleProvider = null;
+        try {
+            bundleProvider = getBundleTask(artifactProject, variant)
+        } catch (Exception ignore) {
+            println("[$variant.name]Can not resolve :$unResolvedArtifact.moduleName")
+            return null
+        }
+
+        if (bundleProvider == null) {
+            return null
+        }
+
+        ModuleVersionIdentifier identifier = createModuleVersionIdentifier(unResolvedArtifact)
+        File artifactFile = createArtifactFile(artifactProject, bundleProvider.get())
+        DefaultIvyArtifactName artifactName = createArtifactName(artifactFile)
+        Factory<File> fileFactory = new Factory<File>() {
+            @Override
+            File create() {
+                return artifactFile
+            }
+        }
+        ComponentArtifactIdentifier artifactIdentifier = createComponentIdentifier(artifactFile)
+        if (AarPlugin.compareVersion(project.gradle.gradleVersion, "6.0.0") >= 0) {
+            TaskDependencyContainer taskDependencyContainer = new TaskDependencyContainer() {
+                @Override
+                void visitDependencies(TaskDependencyResolveContext taskDependencyResolveContext) {
+                    taskDependencyResolveContext.add(createTaskDependency(bundleProvider.get()))
+                }
+            }
+            if (AarPlugin.compareVersion(project.gradle.gradleVersion, "6.8.0") >= 0) {
+                Object fileCalculatedValue = Class.forName(CLASS_CalculatedValueContainer).newInstance(new DisplayName(){
+                    @Override
+                    String getCapitalizedDisplayName() {
+                        return artifactFile.name
+                    }
+
+                    @Override
+                    String getDisplayName() {
+                        return artifactFile.name
+                    }
+                }, artifactFile)
+                return Class.forName(CLASS_PreResolvedResolvableArtifact).newInstance(
+                        identifier,
+                        artifactName,
+                        artifactIdentifier,
+                        fileCalculatedValue,
+                        taskDependencyContainer,
+                        null
+                )
+            } else {
+                return Class.forName(CLASS_DefaultResolvedArtifact)
+                        .newInstance(identifier, artifactName, artifactIdentifier, taskDependencyContainer, fileFactory)
+            }
+        } else {
+            TaskDependency taskDependency = createTaskDependency(bundleProvider.get())
+            return Class.forName(CLASS_DefaultResolvedArtifact)
+                    .newInstance(identifier, artifactName, artifactIdentifier, taskDependency, fileFactory)
+        }
+    }
+
+    private static ModuleVersionIdentifier createModuleVersionIdentifier(ResolvedDependency unResolvedArtifact) {
+        return new DefaultModuleVersionIdentifier(
+                unResolvedArtifact.getModuleGroup(),
+                unResolvedArtifact.getModuleName(),
+                unResolvedArtifact.getModuleVersion()
+        )
+    }
+
+    private static DefaultIvyArtifactName createArtifactName(File artifactFile) {
+        return new DefaultIvyArtifactName(artifactFile.getName(), "aar", "")
+    }
+
+    private static ComponentArtifactIdentifier createComponentIdentifier(final File artifactFile) {
+        return new ComponentArtifactIdentifier() {
+            @Override
+            ComponentIdentifier getComponentIdentifier() {
+                return null
+            }
+
+            @Override
+            String getDisplayName() {
+                return artifactFile.name
+            }
+        }
+    }
+
+    private static Project getArtifactProject(Project project, ResolvedDependency unResolvedArtifact) {
+        for (Project p : project.getRootProject().getAllprojects()) {
+            //println("getArtifactProject $unResolvedArtifact.moduleName / $p.name")
+            if (unResolvedArtifact.moduleName == p.name) {
+                return p
+            }
+        }
+        return null
+    }
+
+    private static File createArtifactFile(Project project, Task bundle) {
+        File output
+        if (AarPlugin.compareVersion(project.gradle.gradleVersion, "5.1") >= 0) {
+            output = new File(bundle.getDestinationDirectory().getAsFile().get(), bundle.getArchiveFileName().get())
+        } else {
+            output = new File(bundle.destinationDir, bundle.archiveName)
+        }
+        return output
+    }
+
+    private static TaskProvider getBundleTask(Project project, def variant) {
+        TaskProvider bundleTaskProvider = null
+        project.android.libraryVariants.find { subVariant ->
+            // 1. find same flavor
+//            println("getBundleTask flavor = $variant.name / $subVariant.name")
+            if (variant.name == subVariant.name) {
+                try {
+                    bundleTaskProvider = getBundleTaskProvider(project, subVariant.name as String)
+                    return true
+                } catch (Exception ignore) {
+                }
+            }
+
+            // 2. find buildType
+//            println("getBundleTask buildType = $variant.buildType.name / $subVariant.name")
+            if (subVariant.name == variant.buildType.name) {
+                try {
+                    bundleTaskProvider = getBundleTaskProvider(project, subVariant.name as String)
+                    return true
+                } catch (Exception ignore) {
+                }
+            }
+
+            // 3. find missingStrategies
+            def flavor = variant.productFlavors.isEmpty() ? variant.mergedFlavor : variant.productFlavors.first()
+//            println("getBundleTask missingStrategies flavor = $flavor / size = ${flavor.missingDimensionStrategies.size()}")
+            try {
+                flavor.missingDimensionStrategies.find { entry ->
+                    String toDimension = entry.getKey()
+                    String toFlavor = entry.getValue().getFallbacks().first()
+                    def subFlavor = subVariant.productFlavors.isEmpty() ?
+                            subVariant.mergedFlavor : subVariant.productFlavors.first()
+//                    println("getBundleTask missingStrategies = $toDimension / $subFlavor.dimension / $toFlavor / $subFlavor.name / $variant.buildType.name / $subVariant.buildType.name")
+                    if (toDimension == subFlavor.dimension
+                            && toFlavor == subFlavor.name
+                            && variant.buildType.name == subVariant.buildType.name) {
+                        try {
+                            bundleTaskProvider = getBundleTaskProvider(project, subVariant.name as String)
+                            return true
+                        } catch (Exception ignore) {
+                        }
+                    }
+                }
+            } catch (Exception ignore) {
+                println("getBundleTask missingStrategies Exception = $ignore")
+            }
+
+            return bundleTaskProvider != null
+        }
+        return bundleTaskProvider
+    }
+
+    static TaskProvider<Task> getBundleTaskProvider(Project project, String variantName) throws UnknownTaskException {
+        def taskPath = "bundle" + variantName.capitalize()
+        TaskProvider bundleTask
+        try {
+            bundleTask = project.tasks.named(taskPath)
+        } catch (UnknownTaskException ignored) {
+            taskPath += "Aar"
+            bundleTask = project.tasks.named(taskPath)
+        }
+//        println("getBundleTaskProvider $bundleTask.name")
+        return bundleTask
+    }
+
+    private static TaskDependency createTaskDependency(Task bundleTask) {
+        return new TaskDependency() {
+            @Override
+            Set<? extends Task> getDependencies(@Nullable Task task) {
+                def set = new HashSet()
+                set.add(bundleTask)
+                return set
+            }
+        }
+    }
+}
+
+//fat-aar插件
+class AarPlugin implements Plugin<Project> {
+    public static final String ARTIFACT_TYPE_AAR = 'aar'
+
+    public static final String ARTIFACT_TYPE_JAR = 'jar'
+
+    private static final String CONFIG_NAME = "embed"
+
+    public static final String CONFIG_SUFFIX = 'Embed'
+    def mBuildDir
+
+    def embedAarNames = new ArrayList()
+    def embedAarFullPath = new ArrayList()
+    def embedAarArtifact = new ArrayList()
+    def embedAarVariant = new ArrayList()
+    def extractAarDirs = new ArrayList()
+    def embedJarArtifact = new ArrayList()
+    def embedJarVariant = new ArrayList()
+    def embedDir
+    def embedJarDir
+    def embedJars = new ArrayList()
+    def embedExplodedDir
+
+    def embedRJavaDir
+    def embedRClassesDir
+    def embedRClasses = new ArrayList()
+
+// path in build folder
+    def packagedResourceDir
+    def packagedJniDir
+    def packagedRDir
+    def packagedLibDir
+
+    private String mAndroidGradleVersion
+    private FatAarExtension mExtension
+    private Project project
+    private final Collection<Configuration> embedConfigurations = new ArrayList<>()
+
+    /**
+     * 初始化一些配置
+     * @param project
+     */
+    private void initVariables(Project project) {
+        mBuildDir = project.buildDir.path.replace(File.separator, '/')
+        embedDir = "$mBuildDir/fat-aar"
+        embedJarDir = "$embedDir/jars"
+        embedExplodedDir = "$embedDir/explode"
+        embedRJavaDir = "$mBuildDir/generated/source/r/java"
+        embedRClassesDir = "$mBuildDir/generated/source/r/classes"
+
+        packagedResourceDir = "$mBuildDir/intermediates/packaged_res"
+        packagedJniDir = "$mBuildDir/intermediates/library_and_local_jars_jni/"
+        packagedRDir = "$mBuildDir/intermediates/compile_r_class_jar/"
+        packagedLibDir = "$mBuildDir/intermediates/aar_libs_directory"
+
+        mExtension = project.extensions.create('fataar', FatAarExtension)
+        mAndroidGradleVersion = project.gradle.gradleVersion
+        println("mAndroidGradleVersion = $mAndroidGradleVersion")
+        project.gradle.startParameter.taskNames.each{
+            println("taskNames $it")
+        }
+        project.gradle.startParameter.taskRequests.each {
+            println("taskRequests $it")
+        }
+    }
+    /**
+     * 根据productFlavors创建依赖配置
+     */
+    private void createConfigurations() {
+        Configuration embedConf = project.configurations.create(CONFIG_NAME)
+        createConfiguration(embedConf)
+        //FatUtils.logInfo("Creating configuration embed")
+
+        project.android.buildTypes.all { buildType ->
+            String configName = buildType.name + CONFIG_SUFFIX
+            Configuration configuration = project.configurations.create(configName)
+            createConfiguration(configuration)
+            //FatUtils.logInfo("Creating configuration " + configName)
+        }
+
+        project.android.productFlavors.all { flavor ->
+            String configName = flavor.name + CONFIG_SUFFIX
+            Configuration configuration = project.configurations.create(configName)
+            createConfiguration(configuration)
+            //FatUtils.logInfo("Creating configuration " + configName)
+            project.android.buildTypes.all { buildType ->
+                String variantName = flavor.name + buildType.name.capitalize()
+                String variantConfigName = variantName + CONFIG_SUFFIX
+                Configuration variantConfiguration = project.configurations.create(variantConfigName)
+                createConfiguration(variantConfiguration)
+                //FatUtils.logInfo("Creating configuration " + variantConfigName)
+            }
+        }
+    }
+
+    private void createConfiguration(Configuration embedConf) {
+        embedConf.visible = false
+        embedConf.transitive = false
+        def compileOnlyConfigName = "compileOnly"
+        if (embedConf.name.endsWith(CONFIG_SUFFIX)) {
+            compileOnlyConfigName = embedConf.name.substring(0, embedConf.name.length() - CONFIG_SUFFIX.length()) + "CompileOnly"
+        }
+        println("createConfiguration compileOnlyConfigName = $compileOnlyConfigName")
+        project.gradle.addListener( new DependencyResolutionListener() {
+            @Override
+            void beforeResolve(ResolvableDependencies resolvableDependencies) {
+                embedConf.dependencies.each { dependency ->
+                    if (dependency instanceof DefaultProjectDependency) {
+                        if (dependency.targetConfiguration == null) {
+                            dependency.targetConfiguration = "default"
+                        }
+                        // support that the module can be indexed in Android Studio 4.0.0
+                        DefaultProjectDependency dependencyClone = dependency.copy()
+                        dependencyClone.targetConfiguration = null
+                        // The purpose is to support the code hints
+                        project.dependencies.add(compileOnlyConfigName, dependencyClone)
+                    } else {
+                        // The purpose is to support the code hints
+                        project.dependencies.add(compileOnlyConfigName, dependency)
+                    }
+                }
+                project.gradle.removeListener(this)
+            }
+
+            @Override
+            void afterResolve(ResolvableDependencies resolvableDependencies) {
+
+            }
+        })
+        embedConfigurations.add(embedConf)
+    }
+
+
+    /**
+     * fat-aar插件主入口
+     * @param project
+     */
+    @Override
+    void apply(Project project) {
+        this.project = project
+        println("plugin ${project.plugins.hasPlugin("com.android.library")}, name = $project.name")
+        if (project.plugins.hasPlugin("com.android.library")) {
+            initVariables(project)
+            createConfigurations()
+            /**
+             * 针对不同的variant创建对应的task
+             */
+            project.android.libraryVariants.all { variant ->
+                /**
+                 * 解压缩aar包
+                 */
+                Task extractAar = project.task("extractAar${variant.name.capitalize()}", group:"fat-aar") {
+                    doFirst {
+                        println "task extractAar first"
+                        def embedDirFile = project.file(embedDir)
+                        def delete = embedDirFile.deleteDir()
+                        println "embedDirFile.deleteDir() = ${delete}"
+                        extractAarDirs.clear()
+                        embedAarNames.clear()
+                    }
+                    doLast {
+                        println "task extractAar last"
+//                        println("delete embedDirFile $embedDirFile = ${embedDirFile.deleteDir()}")
+//                        println("embedAarArtifact variant = ${variant.name}")
+                        for (int i = 0; i < embedAarArtifact.size(); i++) {
+                            def artifact1 = embedAarArtifact.get(i)
+                            def variant1 = embedAarVariant.get(i)
+                            def aarPath = artifact1.file.absolutePath
+//                            println("embedAarArtifact artifact1 = ${artifact1.getModuleVersion().getId()}, variant1 = ${variant1.name}")
+                            //if (variant1.name == variant.name) {
+                                ModuleVersionIdentifier id = artifact1.getModuleVersion().getId()
+                                def outputDir = project.file(embedExplodedDir
+                                        + "/" + id.getGroup()
+                                        + "/" + id.getName()
+                                        + "/" + id.getVersion()
+                                        + "/" + variant1.name)
+                                def aarToFile = project.file(aarPath)
+
+//                            println "extractAar() ready to extract aar: $aarPath, aarName: $aarName, outputPathStr: $outputPathStr"
+
+                            if (aarToFile.exists()) {
+                                extractAarDirs.add(outputDir.absolutePath)
+                                embedAarNames.add(artifact1.file.name)
+
+                                project.copy {
+                                    from project.zipTree(aarToFile)
+                                    into outputDir
+                                }
+                            } else {
+                                project.logger.error("extractAar() aarToFile($aarToFile) not exist")
+                            }
+                            //}
+                        }
+                    }
+                }
+
+                /**
+                 * 打包jni
+                 */
+                Task embedJniLibs = project.task("embedJniLibs${variant.name.capitalize()}", group:"fat-aar") {
+                    doLast {
+                        println "task embedJniLibs"
+
+                        for (int i = 0; i < extractAarDirs.size(); i++) {
+                            def aarPath = extractAarDirs.get(i)
+                            def aarName = embedAarNames.get(i)
+                            def variant1 = embedAarVariant.get(i)
+                            //println "embedJniLibs variant1 = $variant1.name / variant = $variant.name"
+                            if (variant1.name != variant.name) {
+                                continue
+                            }
+                            def source = "$aarPath/jni"
+                            def jniPath = packagedJniDir
+
+                            File jniDir = project.file(jniPath)
+                            jniDir.eachDir { subDir ->
+                                def destination = "${subDir.getAbsolutePath().replace(File.separator, '/')}/jni"
+//                                println "embedJniLibs() copy $source to $destination"
+                                project.copy {
+                                    from project.fileTree(dir: source)
+                                    into project.file(destination)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /**
+                 * 打包aar的classes 和 jar包
+                 */
+                Task embedClassesAndJars = project.task("embedClassesAndJars${variant.name.capitalize()}", group:"fat-aar") {
+                    doFirst {
+                        println "task embedClassesAndJars"
+
+
+                        for (int i = 0; i < extractAarDirs.size(); i++) {
+                            def aarPath = extractAarDirs.get(i)
+                            def aarName = embedAarNames.get(i)
+                            def variant1 = embedAarVariant.get(i)
+                            //println "embedClassesAndJars variant1 = $variant1.name / variant = $variant.name"
+                            if (variant1.name != variant.name) {
+                                continue
+                            }
+
+                            FileTree aarFileTree = project.fileTree(dir: "$aarPath")
+                            def sourceJar = aarFileTree.files.find { it.name.contains("classes.jar") }
+                            def destination = embedJarDir
+
+//                            println "embedClassesAndJars() copy aar= $aarPath source $sourceJar to $destination"
+                            project.copy {
+                                from sourceJar
+                                into destination
+                                rename 'classes.jar', aarName
+                            }
+                        }
+
+                        for (int i = 0; i < embedJarArtifact.size(); i++) {
+                            def artifact = embedJarArtifact.get(i)
+                            def jarPath = artifact.file.absolutePath
+
+//                            println "embedClassesAndJars() copy source $jarPath to $embedJarDir"
+                            project.copy {
+                                from jarPath
+                                into embedJarDir
+                            }
+                        }
+
+                        project.fileTree(embedJarDir).each {
+                            embedJars.add(it)
+                        }
+                    }
+
+                    doLast {
+                        println("embedClassesAndJars() doLast Variant = $variant.name")
+                        def output = getClassPathDirFiles(variant).first()
+                        for (jarFile in embedJars) {
+//                            println("embedClassesAndJars() doLast copy = $jarFile to ${output} / exist = ${jarFile.exists()}")
+                            if (!jarFile.exists()) {
+                                continue
+                            }
+                            project.copy {
+                                from project.zipTree(jarFile)
+                                into output
+                                exclude 'META-INF/'
+                            }
+                        }
+
+                    }
+                }
+                /**
+                 * 处理aar的R文件
+                 */
+                Task generateRJava = project.task("generateRJava${variant.name.capitalize()}", group:"fat-aar") {
+                    doLast {
+                        println "task generateRJava"
+                        def embedRJavaDirFile = project.file(embedRJavaDir)
+                        def delete = embedRJavaDirFile.deleteDir()
+                        println "generateRJava.deleteDir() = ${delete}"
+
+                        def mainManifestFile = project.android.sourceSets.main.manifest.srcFile
+                        def libPackageName = ""
+
+                        if (!mainManifestFile.exists()) {
+                            ant.fail("generateRJava() main manifest doesn't exist!")
+                        }
+                        libPackageName = new XmlParser().parse(mainManifestFile).@package
+
+                        for (int i = 0; i < extractAarDirs.size(); i++) {
+                            def aarPath = extractAarDirs.get(i)
+                            def variant1 = embedAarVariant.get(i);
+//                            println("generateRJava variant1 = $variant1.name / variant = $variant.name / aarPath = $aarPath")
+                            if (variant.name != variant1.name) {
+                                continue
+                            }
+                            def manifestFile = project.file("$aarPath/AndroidManifest.xml")
+                            if (!manifestFile.exists()) {
+                                println "generateRJava() there is no AndroidManifest.xml in $aarPath, continue to next aar"
+                                return // continue in closure extractAarDirs.each
+                            }
+
+                            def aarManifest = new XmlParser().parse(manifestFile)
+                            def aarPackageName = aarManifest.@package
+                            String packagePath = aarPackageName.replace('.', '/')
+
+                            def rTxt = project.file("$aarPath/R.txt")
+                            def rMap = new ConfigObject()
+
+                            if (rTxt.exists()) {
+                                rTxt.eachLine { line ->
+                                    def (type, subclass, name, value) = line.tokenize(' ')
+                                    (rMap[subclass][name] = type)
+                                }
+                            } else {
+                                println "generateRJava() File is not exist ${rTxt.getAbsolutePath().replace(File.separator, '/')}"
+                            }
+
+                            def resDirPath= "$packagedResourceDir/$variant.name"
+//                            println "resDirPath: $resDirPath"
+
+                            def stringBuilder = "package $aarPackageName;" << '\n' << '\n'
+                            stringBuilder << 'public final class R {' << '\n'
+
+                            rMap.each { subclass, values ->
+                                stringBuilder << "  public static final class $subclass {" << '\n'
+
+                                def isPackagedResExist = isPackagedResourceTypeExist(subclass, resDirPath)
+                                if(isPackagedResExist) {
+                                    def resList = getPackagedResourceList(subclass, resDirPath)
+                                    values.each { name, type ->
+                                        if (resList.contains(name)) {
+                                            stringBuilder << "    public static $type $name = ${libPackageName}.R.${subclass}.${name};" << '\n'
+                                        }
+                                    }
+                                } else {
+                                    values.each { name, type ->
+                                        stringBuilder << "    public static $type $name = ${libPackageName}.R.${subclass}.${name};" << '\n'
+                                    }
+                                }
+                                stringBuilder << "  }" << '\n'
+                            }
+                            stringBuilder << '}' << '\n'
+
+                            def currentRFileDir = "$embedRJavaDir/$packagePath"
+                            def currentRFilePath = "$currentRFileDir/R.java"
+
+                            project.mkdir(currentRFileDir)
+                            project.file(currentRFilePath).write(stringBuilder.toString())
+                            embedRClasses += "$packagePath/R.class"
+                            embedRClasses += "$packagePath/R\$*.class"
+//                            println("embedRClasses = $embedRClasses")
+                        }
+                    }
+                }
+
+                /**
+                 * 编译R文件
+                 */
+                Task compileRJava = project.task("compileRJava${variant.name.capitalize()}", type:JavaCompile, group:"fat-aar") {
+                    source = embedRJavaDir
+                    def refClassPath = packagedRDir + "release/R.jar"
+                    //println "compileRJava() refClassPath: $refClassPath"
+                    classpath = project.files(refClassPath)
+                    //println "compileRJava()embedRClassesDir: $embedRClassesDir"
+                    getDestinationDirectory().set(project.file(embedRClassesDir))
+
+                    doFirst {
+                        refClassPath = packagedRDir + variant.name + "/R.jar"
+                        println "compileRJava() doFirst refClassPath: $refClassPath"
+                        classpath = project.files(refClassPath)
+                    }
+                }
+
+                /**
+                 * 打包R文件为jar
+                 */
+                Task embedRClass = project.task ("embedRClass${variant.name.capitalize()}", type: Jar, group:"fat-aar") {
+                    archiveBaseName = "embedR"
+                    from embedRClassesDir
+                    include embedRClasses
+                    destinationDirectory = project.file(embedJarDir)
+                }
+
+                /**
+                 * 拷贝R文件jar到libs目录下
+                 */
+                Task copyEmbedRJar = project.task("copyEmbedRJar${variant.name.capitalize()}", group:"fat-aar") {
+                    doLast {
+                        println "task copyEmbedRJar"
+
+                        File libsDir = project.file(packagedLibDir)
+                        libsDir.eachDir { subDir ->
+                            project.copy {
+                                from project.file("$embedJarDir/embedR.jar")
+                                into project.file("${subDir.getAbsolutePath().replace(File.separator, '/')}/libs")
+                            }
+                        }
+                    }
+                }
+
+                /**
+                 * 打包资源文件
+                 */
+                Task embedLibraryResources = project.task("embedLibraryResources${variant.name.capitalize()}", group:"fat-aar") {
+                    doLast {
+                        println "task embedLibraryResources"
+
+                        for (int i = 0; i < extractAarDirs.size(); i++) {
+                            def aarPath = extractAarDirs.get(i)
+                            def variant1 = embedAarVariant.get(i);
+                            if (variant.name != variant1.name) {
+                                continue
+                            }
+                            def source = "$aarPath/res"
+
+                            project.android.sourceSets.each {
+                                if (it.name == variant.name) {
+                                    it.res.srcDir(project.file(source))
+                                }
+                            }
+                        }
+//                        project.android.sourceSets.each {
+//                            println "embedLibraryResources name = $it.name / res.srcDirs: $it.res.sourceFiles.files"
+//                        }
+                    }
+                }
+
+                /**
+                 *移除资源文件
+                 */
+                Task removeAllResourcesIfAnyDpiExist = project.task("removeAllResourcesIfAnyDpiExist${variant.name.capitalize()}", group:"fat-aar") {
+                    doLast {
+                        println "task removeAllResourcesIfAnyDpiExist"
+                        def resDirPath = "$packagedResourceDir/$variant.name"
+                        removeResourcesIfAnyDpiExist(resDirPath)
+                    }
+                }
+
+                /**
+                 * 打包Assets文件
+                 */
+                Task embedAssets = project.task("embedAssets${variant.name.capitalize()}", group:"fat-aar") {
+                    doLast {
+                        println "task embedAssets"
+                        extractAarDirs.each { aarPath ->
+                            def assetDir = "$aarPath/assets"
+//                            println "embedAssets() add to assets.srcDirs: $assetDir"
+                            project.android.sourceSets.each {
+                                if (it.name == variant.name) {
+                                    it.assets.srcDirs(project.file(assetDir))
+                                }
+                            }
+                        }
+//                        project.android.sourceSets.each {
+//                            println "embedAssets name = $it.name / res.srcDirs: $it.assets.sourceFiles.files"
+//                        }
+                    }
+                }
+
+
+                /* merge resources (res) */
+                embedLibraryResources.dependsOn extractAar
+                removeAllResourcesIfAnyDpiExist.dependsOn embedLibraryResources
+
+                /* merge classes */
+                embedClassesAndJars.dependsOn extractAar
+
+                /* merge jni */
+                embedJniLibs.dependsOn extractAar
+
+                /* merge R classes */
+                generateRJava.dependsOn extractAar
+                compileRJava.dependsOn generateRJava
+                embedRClass.dependsOn compileRJava
+                copyEmbedRJar.dependsOn embedRClass
+
+                /* merge assets */
+                embedAssets.dependsOn extractAar
+
+                /* merge resources (res) */
+                Task packageResources = project.tasks."package${variant.name.capitalize()}Resources"
+                packageResources.dependsOn embedLibraryResources
+                removeAllResourcesIfAnyDpiExist.dependsOn packageResources
+
+                Task mergeResources = project.tasks."merge${variant.name.capitalize()}Resources"
+                mergeResources.dependsOn removeAllResourcesIfAnyDpiExist
+
+                /* merge classes */
+                Task compileJavaWithJavac = project.tasks."compile${variant.name.capitalize()}JavaWithJavac"
+                compileJavaWithJavac.dependsOn embedClassesAndJars
+                /* merge R classes */
+                compileJavaWithJavac.dependsOn generateRJava
+                compileJavaWithJavac.dependsOn compileRJava
+                Task generateRFile = project.tasks."generate${variant.name.capitalize()}RFile"
+                generateRJava.dependsOn generateRFile
+                compileRJava.dependsOn generateRFile
+
+                /* merge jni */
+                Task bundleAar = project.tasks."bundle${variant.name.capitalize()}Aar"
+                bundleAar.dependsOn embedJniLibs
+                bundleAar.dependsOn embedRClass
+                bundleAar.dependsOn copyEmbedRJar
+                Task copyJniLibsProjectAndLocalJars = project.tasks."copy${variant.name.capitalize()}JniLibsProjectAndLocalJars"
+                embedJniLibs.dependsOn copyJniLibsProjectAndLocalJars
+
+                if (variant.buildType.minifyEnabled) {
+                    Task minify = project.tasks."minify${variant.name.capitalize()}WithR8"
+                    minify.dependsOn embedRClass
+                }
+
+                Task syncLibJars = project.tasks."sync${variant.name.capitalize()}LibJars"
+                copyEmbedRJar.dependsOn syncLibJars
+                /* merge assets */
+                Task generateAssets = project.tasks."generate${variant.name.capitalize()}Assets"
+                generateAssets.dependsOn embedAssets
+            }
+            project.afterEvaluate {
+                doAfterEvaluate()
+            }
+        }
+    }
+
+    def isPackagedResourceTypeExist(resourceType, resDirPath) {
+        def resDirExist = false
+        File resDir = project.file(resDirPath)
+
+//        println "isPackagedResourceTypeExist() resourceType: " + resourceType
+//        println "isPackagedResourceTypeExist() resDir: " + resDir
+
+        try {
+            resDir.eachDir { subDir ->
+                if (subDir.name.contains(resourceType)) {
+                    resDirExist = true
+                    throw new Exception("find existed packaged resource, break from closure")
+                }
+            }
+        } catch (Exception e) {
+            println "isPackagedResourceTypeExist() " + e.message
+        }
+
+        return resDirExist
+    }
+
+    def getPackagedResourceList(resourceType, resDirPath) {
+        Set<String> resList = new HashSet<>()
+
+        File resDir = project.file(resDirPath)
+
+        resDir.eachDir { subDir ->
+            if (subDir.name.contains(resourceType)) {
+                subDir.eachFile { subFile ->
+                    def (filename, ext) = subFile.name.tokenize('.')
+                    resList.add(filename)
+                    // println "getResourceDrawableList() drawable name: " + filename
+                }
+            }
+        }
+
+        return resList
+    }
+
+    def removeResourcesIfAnyDpiExist(resDirPath) {
+        println "removeResourcesIfAnyDpiExist() resDirPath: $resDirPath"
+
+        File resDir = project.file(resDirPath)
+        def resOfAnyDpi = new ArrayList()
+
+        resDir.eachDir { subDir ->
+            if (subDir.name.contains("anydpi")) {
+                subDir.eachFile { subFile ->
+                    resOfAnyDpi.add(subFile.name)
+                }
+            }
+        }
+        resDir.eachDir { subDir ->
+            if (subDir.name.contains("xhdpi")) {
+                // drawable anydpi is available, there is no need to keep duplicate resources in xhdpi or bigger dpi
+                resOfAnyDpi.each { resFile ->
+                    def (filename, ext) = resFile.tokenize('.')
+                    delete subDir.absolutePath + "/" + filename + ".png"
+                }
+            }
+        }
+    }
+
+    ConfigurableFileCollection getClassPathDirFiles(def variant) {
+        ConfigurableFileCollection classpath
+        if (compareVersion(mAndroidGradleVersion, "3.5.0") >= 0) {
+            classpath = project.files("${project.buildDir.path}/intermediates/" +
+                    "javac/${variant.name}/classes")
+        } else if (compareVersion(mAndroidGradleVersion, "3.2.0") >= 0) { // >= Versions 3.2.X
+            classpath = project.files("${project.buildDir.path}/intermediates/" +
+                    "javac/${variant.name}/compile${variant.name.capitalize()}JavaWithJavac/classes")
+        } else { // Versions 3.0.x and 3.1.x
+            classpath = project.files("${project.buildDir.path}/intermediates/classes/${variant.dirName}")
+        }
+        return classpath
+    }
+
+    static int compareVersion(String v1, String v2) {
+        if (v1 == v2) {
+            return 0
+        }
+
+        String[] version1 = v1.split("-")
+        String[] version2 = v2.split("-")
+        String[] version1Array = version1[0].split("[._]")
+        String[] version2Array = version2[0].split("[._]")
+
+        String preRelease1 = new String()
+        String preRelease2 = new String()
+        if (version1.length > 1) {
+            preRelease1 = version1[1]
+        }
+        if (version2.length > 1) {
+            preRelease2 = version2[1]
+        }
+
+        int index = 0
+        int minLen = Math.min(version1Array.length, version2Array.length)
+        long diff = 0
+
+        while (index < minLen
+                && (diff = Long.parseLong(version1Array[index])
+                - Long.parseLong(version2Array[index])) == 0) {
+            index++
+        }
+        if (diff == 0) {
+            for (int i = index; i < version1Array.length; i++) {
+                if (Long.parseLong(version1Array[i]) > 0) {
+                    return 1
+                }
+            }
+
+            for (int i = index; i < version2Array.length; i++) {
+                if (Long.parseLong(version2Array[i]) > 0) {
+                    return -1
+                }
+            }
+            //compare pre-release
+            if (!preRelease1.isEmpty() && preRelease2.isEmpty()) {
+                return -1
+            } else if (preRelease1.isEmpty() && !preRelease2.isEmpty()) {
+                return 1
+            } else if (!preRelease1.isEmpty() && !preRelease2.isEmpty()) {
+                int preReleaseDiff = preRelease1 <=> preRelease2;
+                if (preReleaseDiff > 0) {
+                    return 1
+                } else if (preReleaseDiff < 0) {
+                    return -1
+                }
+            }
+            return 0
+        } else {
+            return diff > 0 ? 1 : -1
+        }
+    }
+
+    private void processArtifact(ResolvedArtifact artifact, def variant) {
+//        println("processArtifact artifact = $artifact")
+//        println("processArtifact artifact = $artifact.file")
+        if (ARTIFACT_TYPE_AAR == artifact.type) {
+            embedAarArtifact.add(artifact)
+            embedAarVariant.add(variant)
+            Set<Task> dependencies
+            if (getTaskDependency(artifact) instanceof TaskDependency) {
+                dependencies = artifact.buildDependencies.getDependencies()
+            } else {
+                CachingTaskDependencyResolveContext context = new CachingTaskDependencyResolveContext()
+                getTaskDependency(artifact).visitDependencies(context)
+                if (context.queue.size() == 0) {
+                    dependencies = new HashSet<>()
+                } else {
+                    dependencies = context.queue.getFirst().getDependencies()
+                }
+            }
+            String taskPath = 'pre' + variant.name.capitalize() + 'Build'
+            TaskProvider prepareTask = project.tasks.named(taskPath)
+            Task extractAar = project.tasks.named("extractAar${variant.name.capitalize()}").get()
+            //println("dependencies dependencies.size() = ${dependencies.size()} / prepareTask = $prepareTask / extractAar = $extractAar")
+            if (dependencies.size() == 0) {
+                extractAar.dependsOn(prepareTask)
+            } else {
+                //println("dependencies first = ${dependencies.first()}")
+                extractAar.dependsOn(dependencies.first())
+            }
+        } else if (ARTIFACT_TYPE_JAR == artifact.type) {
+            embedJarArtifact.add(artifact)
+            embedJarVariant.add(variant)
+
+        }
+    }
+
+    static def getTaskDependency(ResolvedArtifact artifact) {
+        try {
+            return artifact.buildDependencies
+        } catch(MissingPropertyException ignore) {
+            // since gradle 6.8.0, property is changed;
+            return artifact.builtBy
+        }
+    }
+
+    private void doAfterEvaluate() {
+        embedConfigurations.each {
+            if (project.fataar.transitive) {
+                it.transitive = true
+            }
+        }
+        project.android.libraryVariants.all { variant ->
+            String flavorName = variant.flavorName
+            String buildType = variant.buildType.name
+            String flavorBuildType = variant.name.capitalize()
+            boolean enableProguard = variant.buildType.minifyEnabled
+            println("flavorName = ${flavorName} / buildType = $buildType / flavorBuildType = $flavorBuildType / enableProguard = $enableProguard" )
+            //远程依赖
+            Collection<String> depRemoteArray = new ArrayList()
+            //本地libs下面的依赖
+            Collection<String> depLocaleArray = new ArrayList()
+            //本地module依赖
+            Collection<String> depProjectArray = new ArrayList()
+            embedConfigurations.each {configuration ->
+                if (configuration.name == CONFIG_NAME
+                        || configuration.name == variant.getBuildType().name + CONFIG_SUFFIX
+                        || configuration.name == variant.getFlavorName() + CONFIG_SUFFIX
+                        || configuration.name == variant.name + CONFIG_SUFFIX) {
+                    configuration.dependencies.each {
+                        println("dependencies = $it")
+                        if (it instanceof DefaultProjectDependency) {
+                            //println("DefaultProjectDependency $it.name $it.group $it.version")
+                            depProjectArray.add(it.name)
+                        }
+                    }
+                    configuration.resolvedConfiguration.firstLevelModuleDependencies.each {
+                        println("first = $it.moduleGroup/$it.moduleName/$it.moduleVersion")
+                        if (depProjectArray.contains(it.moduleName)) {
+                            def flavorArtifact = FlavorArtifact.createFlavorArtifact(project, variant, it)
+                            if (flavorArtifact != null) {
+                                println("flavorArtifact = $flavorArtifact")
+                                processArtifact(flavorArtifact, variant)
+                            }
+                        } else if (it.moduleGroup != null && it.moduleGroup.length() > 0) {
+                            depRemoteArray.add(it.moduleGroup)
+                        } else {
+                            depLocaleArray.add(it.moduleName)
+                        }
+                    }
+                    println("depRemoteArray = $depRemoteArray")
+                    println("depLocaleArray = $depLocaleArray")
+                    println("depProjectArray = $depProjectArray")
+                    configuration.resolvedConfiguration.resolvedArtifacts.each { artifact ->
+                        def displayName = artifact.id.componentIdentifier.displayName
+                        def (groupName, ext) = displayName.tokenize(':')
+                        def moduleName = artifact.moduleVersion.id.module.name
+                        def contains = depRemoteArray.contains(groupName) || depLocaleArray.contains(moduleName)
+                        println("resolvedConfiguration = $displayName / $groupName / $moduleName / contains = $contains")
+                        if (contains) {
+                            processArtifact(artifact, variant)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+apply plugin: AarPlugin
